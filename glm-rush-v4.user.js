@@ -124,15 +124,10 @@
         }
     }
 
-    // 仅对目标URL响应做patch的标记
-    let _shouldPatch = false;
-
+    // 全局 patch: 页面加载时也需要解除售罄状态，否则按钮不可点击
     JSON.parse = function (text, reviver) {
         const result = _parse(text, reviver);
-        if (_shouldPatch) {
-            try { patchSoldOut(result); } catch {}
-            _shouldPatch = false;
-        }
+        try { patchSoldOut(result); } catch {}
         return result;
     };
     Object.defineProperty(JSON.parse, 'toString', { value: () => 'function parse() { [native code] }' });
@@ -155,11 +150,9 @@
                 return { ok: false, reason: '429 限流', attempt: attemptNum };
             }
 
-            _shouldPatch = true;  // 让 JSON.parse 对此响应做 patch
             const text = await resp.text();
             let data;
             try { data = _parse(text); } catch { data = null; }
-            _shouldPatch = false;
 
             if (data && data.code === 200 && data.data && data.data.bizId) {
                 const bizId = data.data.bizId;

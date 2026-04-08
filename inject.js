@@ -112,15 +112,10 @@
         }
     }
 
-    // 仅对目标URL响应做patch的标记
-    let _shouldPatch = false;
-
+    // 全局 patch: 页面加载时也需要解除售罄状态，否则按钮不可点击
     JSON.parse = function (text, reviver) {
         const result = _parse(text, reviver);
-        if (_shouldPatch) {
-            try { patchSoldOut(result); } catch {}
-            _shouldPatch = false;
-        }
+        try { patchSoldOut(result); } catch {}
         return result;
     };
     Object.defineProperty(JSON.parse, 'toString', { value: () => 'function parse() { [native code] }' });
@@ -143,11 +138,9 @@
                 return { ok: false, reason: '429 限流', attempt: attemptNum };
             }
 
-            _shouldPatch = true;  // 让 JSON.parse 对此响应做 patch
             const text = await resp.text();
             let data;
             try { data = _parse(text); } catch { data = null; }
-            _shouldPatch = false;
 
             if (data && data.code === 200 && data.data && data.data.bizId) {
                 const bizId = data.data.bizId;
@@ -458,23 +451,91 @@
 
     async function autoRecover() {
         if (recovering || recoveryAttempts >= CFG.recoveryMax || !state.lastSuccess) return;
-        const dialog = findErrorDialog();
-        if (!dialog) return;
 
         recovering = true;
         recoveryAttempts++;
         try {
-            log('检测到错误弹窗, 自动恢复...');
-            setState({ cache: state.lastSuccess });
-            dismissDialog(dialog);
-            await sleep(400);
-            const still = findErrorDialog();
-            if (still) { dismissDialog(still); await sleep(200); }
+            // 策略1: 关闭所有弹窗/遮罩 (暴力清理)
+            const dialog = findErrorDialog();
+            if (dialog) {
+                log('检测到错误弹窗, 清理中...');
+                dismissDialog(dialog);
+                await sleep(300);
+            }
+            // 清理所有可能残留的遮罩层
+            document.querySelectorAll('.el-overlay, .v-modal, .el-overlay-dialog, [class*="overlay"], [class*="mask"]').forEach(el => {
+                el.style.display = 'none';
+            });
+            document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper').forEach(el => {
+                el.style.display = 'none';
+            });
+            // 移除 body 上的 overflow:hidden (弹窗锁定滚动)
+            document.body.style.overflow = '';
+            document.body.classList.remove('el-popup-parent--hidden');
+            await sleep(200);
 
+            // 策略2: 缓存响应 + 重新点购买按钮
+            setState({ cache: state.lastSuccess });
             const btn = findBuyButton();
-            if (btn) { btn.click(); log('已重新点击购买按钮'); }
-            else { log('未找到购买按钮'); alert('已获取到商品! 请手动点击购买!'); }
+            if (btn) {
+                btn.click();
+                log('已重新点击购买按钮 (策略2)');
+                await sleep(2000);
+            }
+
+            // 策略3: 检查支付弹窗是否出现, 没有则直接用 bizId 构造支付
+            const payDialog = document.querySelector('[class*="pay"], [class*="qrcode"], [class*="wechat"], [class*="alipay"]');
+            if (!payDialog || payDialog.offsetParent === null) {
+                const bizId = state.bizId;
+                if (bizId) {
+                    log('支付弹窗未出现, 尝试直接调用 check 页面...');
+                    // 尝试直接打开支付 — 有些网站 check 接口会返回支付链接
+                    try {
+                        const checkUrl = `${location.origin}${CFG.CHECK}?bizId=${encodeURIComponent(bizId)}`;
+                        const resp = await _fetch(checkUrl, { credentials: 'include' });
+                        const data = await resp.json();
+                        log('check响应: ' + JSON.stringify(data).substring(0, 200));
+
+                        // 如果有支付URL, 直接跳转
+                        if (data.data && typeof data.data === 'string' && data.data.startsWith('http')) {
+                            log('获取到支付链接, 跳转中...');
+                            window.open(data.data, '_blank');
+                        } else if (data.data && data.data.payUrl) {
+                            log('获取到payUrl, 跳转中...');
+                            window.open(data.data.payUrl, '_blank');
+                        } else if (data.data && data.data.qrCode) {
+                            log('获取到二维码数据');
+                            showQRCodeFallback(data.data.qrCode, bizId);
+                        }
+                    } catch (e) {
+                        log('check调用失败: ' + e.message);
+                    }
+                }
+
+                // 策略4: 最终兜底 — 弹窗提醒手动操作
+                if (!document.querySelector('[class*="pay"], [class*="qrcode"]')) {
+                    log('所有自动恢复策略已尝试, 请手动操作');
+                    const bizId = state.bizId;
+                    alert(`已抢到 bizId=${bizId}\n\n请尝试:\n1. 刷新页面后立即点击购买\n2. 或手动访问支付页面`);
+                }
+            } else {
+                log('支付弹窗已出现!');
+            }
         } finally { recovering = false; }
+    }
+
+    /** 兜底: 直接在页面上显示二维码 */
+    function showQRCodeFallback(qrData, bizId) {
+        const div = document.createElement('div');
+        div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#fff;padding:30px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.3);text-align:center';
+        div.innerHTML = `
+            <h3 style="margin:0 0 15px;color:#333">扫码支付</h3>
+            <img src="${qrData}" style="width:200px;height:200px" onerror="this.parentElement.innerHTML+='<p>二维码加载失败</p>'">
+            <p style="margin:15px 0 0;color:#666;font-size:13px">bizId: ${bizId}</p>
+            <button onclick="this.parentElement.remove()" style="margin-top:10px;padding:6px 20px;border:1px solid #ddd;border-radius:4px;cursor:pointer">关闭</button>
+        `;
+        document.body.appendChild(div);
+        log('已显示兜底支付二维码');
     }
 
     // MutationObserver 监控弹窗 (替代 setInterval)
