@@ -6,7 +6,7 @@
     // ═══════════════════════════════════════════
     const DEFAULT_CFG = {
         concurrency: 3,       // 并发路数
-        maxRetry: 500,        // 最大重试次数
+        maxRetry: 2000,       // 最大重试次数
         burstCount: 10,       // 前N次零延迟爆发
         fastDelay: 50,        // 爆发后的快速间隔
         slowDelay: 150,       // 后期随机间隔中值
@@ -190,6 +190,8 @@
             let totalAttempt = 0;
             let consecutiveErrors = 0;
             let throttleCount = 0;
+            let consecutiveSoldOut = 0;
+            let consecutiveBusy = 0;
 
             while (totalAttempt < CFG.maxRetry && !stopRequested) {
                 const batchSize = Math.min(CFG.concurrency, CFG.maxRetry - totalAttempt);
@@ -273,6 +275,39 @@
 
                 // EXPIRE → 立即重试不等待
                 if (reasons.every(r => r === 'EXPIRE')) continue;
+
+                // 连续售罄检测 — 非抢购时间不要浪费重试
+                const soldOutCount = reasons.filter(r => r === '售罄').length;
+                const busyCount = reasons.filter(r => r === '系统繁忙').length;
+                if (soldOutCount === batchSize) {
+                    consecutiveSoldOut++;
+                } else {
+                    consecutiveSoldOut = 0;
+                }
+                // 连续全部返回系统繁忙 → 可能不在抢购时间
+                if (busyCount === batchSize) {
+                    consecutiveBusy++;
+                } else {
+                    consecutiveBusy = 0;
+                }
+
+                // 连续5轮全售罄 → 放慢重试 (2秒一次)
+                if (consecutiveSoldOut >= 5) {
+                    if (consecutiveSoldOut === 5) log('连续售罄, 降速重试 (2s间隔)...');
+                    await sleep(2000);
+                    continue;
+                }
+
+                // 连续5轮全系统繁忙 → 可能不在抢购窗口, 放慢到5秒
+                if (consecutiveBusy >= 5) {
+                    if (consecutiveBusy === 5) log('连续系统繁忙, 可能未到抢购时间, 降速 (5s间隔)...');
+                    await sleep(5000);
+                    // 每30轮检查一次是否恢复
+                    if (consecutiveBusy % 30 === 0) {
+                        log(`仍在等待... 已重试${totalAttempt}次 (系统繁忙)`);
+                    }
+                    continue;
+                }
 
                 // 日志 (前5次 + 每20次)
                 if (totalAttempt <= 5 * CFG.concurrency || totalAttempt % (20 * CFG.concurrency) === 0) {
@@ -694,7 +729,7 @@
 .keys{font-size:10px;color:#636e72;text-align:center;margin-top:6px}
 </style>
 <div class="panel">
-  <div class="hd" id="drag"><b>GLM v4.0</b><button class="mn" id="min">-</button></div>
+  <div class="hd" id="drag"><b>GLM v4.2</b><button class="mn" id="min">-</button></div>
   <div class="bd" id="bd">
     <div class="st st-idle" id="st">等待中</div>
     <div class="cap" id="cap">${state.captured ? '已恢复上次捕获的请求' : '请先点一次购买按钮'}</div>

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.1
+// @version      4.3
 // @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
@@ -18,7 +18,7 @@
     // ═══════════════════════════════════════════
     const DEFAULT_CFG = {
         concurrency: 3,       // 并发路数
-        maxRetry: 500,        // 最大重试次数
+        maxRetry: 2000,       // 最大重试次数
         burstCount: 10,       // 前N次零延迟爆发
         fastDelay: 50,        // 爆发后的快速间隔
         slowDelay: 150,       // 后期随机间隔中值
@@ -202,6 +202,7 @@
             let totalAttempt = 0;
             let consecutiveErrors = 0;
             let throttleCount = 0;
+            let consecutiveSoldOut = 0;
 
             while (totalAttempt < CFG.maxRetry && !stopRequested) {
                 const batchSize = Math.min(CFG.concurrency, CFG.maxRetry - totalAttempt);
@@ -286,9 +287,29 @@
                 // EXPIRE → 立即重试不等待
                 if (reasons.every(r => r === 'EXPIRE')) continue;
 
+                // 前20秒全速冲，之后才考虑降速
+                const elapsedSec = (performance.now() - state.stats.startTime) / 1000;
+
+                if (elapsedSec > 20) {
+                    // 超过20秒 — 检测是否该降速
+                    const soldOutCount = reasons.filter(r => r === '售罄').length;
+                    if (soldOutCount === batchSize) {
+                        consecutiveSoldOut++;
+                    } else {
+                        consecutiveSoldOut = 0;
+                    }
+                    // 连续10轮全售罄 → 可能已经抢完了
+                    if (consecutiveSoldOut >= 10) {
+                        if (consecutiveSoldOut === 10) log('连续售罄, 可能已抢完, 降速 (2s)...');
+                        await sleep(2000);
+                        continue;
+                    }
+                }
+
                 // 日志 (前5次 + 每20次)
                 if (totalAttempt <= 5 * CFG.concurrency || totalAttempt % (20 * CFG.concurrency) === 0) {
-                    log(`#${totalAttempt} ${reasons[0]}`);
+                    const sec = elapsedSec.toFixed(0);
+                    log(`#${totalAttempt} ${reasons[0]} (${sec}s)`);
                 }
 
                 // 自适应延迟
@@ -706,7 +727,7 @@
 .keys{font-size:10px;color:#636e72;text-align:center;margin-top:6px}
 </style>
 <div class="panel">
-  <div class="hd" id="drag"><b>GLM v4.1</b><button class="mn" id="min">-</button></div>
+  <div class="hd" id="drag"><b>GLM v4.3</b><button class="mn" id="min">-</button></div>
   <div class="bd" id="bd">
     <div class="st st-idle" id="st">等待中</div>
     <div class="cap" id="cap">${state.captured ? '已恢复上次捕获的请求' : '请先点一次购买按钮'}</div>
