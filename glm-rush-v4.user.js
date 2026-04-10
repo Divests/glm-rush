@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.6
+// @version      4.7
 // @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
@@ -263,7 +263,8 @@
                     });
                     log(`成功! bizId=${winner.bizId} (第${winner.attempt}次)`);
                     recoveryAttempts = 0;
-                    setTimeout(autoRecover, 500);
+                    // 不再自动调 autoRecover，由 startProactive 处理后续流程
+                    // autoRecover 的暴力清弹窗会把支付弹窗也关掉
                     return { ok: true, text: winner.text, data: winner.data, status: winner.status };
                 }
 
@@ -513,30 +514,41 @@
         return true;
     }
 
+    /** 检查页面上是否有支付弹窗（不能关！）*/
+    function hasPaymentDialog() {
+        const paySelectors = '[class*="pay"], [class*="qrcode"], [class*="wechat"], [class*="alipay"], [class*="cashier"]';
+        for (const el of document.querySelectorAll(paySelectors)) {
+            if (el.offsetParent !== null || window.getComputedStyle(el).position === 'fixed') return true;
+        }
+        // 也检查 iframe（支付宝/微信支付可能用 iframe）
+        for (const iframe of document.querySelectorAll('iframe')) {
+            const src = iframe.src || '';
+            if (/alipay|wechat|wxpay|pay|cashier/i.test(src)) return true;
+        }
+        return false;
+    }
+
     async function autoRecover() {
         if (recovering || recoveryAttempts >= CFG.recoveryMax || !state.lastSuccess) return;
+
+        // 如果支付弹窗已经出现，不要干扰它！
+        if (hasPaymentDialog()) {
+            log('支付弹窗已出现, 跳过恢复');
+            return;
+        }
 
         recovering = true;
         recoveryAttempts++;
         try {
-            // 策略1: 关闭所有弹窗/遮罩 (暴力清理)
+            // 只关闭明确的错误弹窗，不暴力清理所有弹窗
             const dialog = findErrorDialog();
-            if (dialog) {
-                log('检测到错误弹窗, 清理中...');
-                dismissDialog(dialog);
-                await sleep(300);
+            if (!dialog) {
+                log('无错误弹窗, 跳过恢复');
+                return;
             }
-            // 清理所有可能残留的遮罩层
-            document.querySelectorAll('.el-overlay, .v-modal, .el-overlay-dialog, [class*="overlay"], [class*="mask"]').forEach(el => {
-                el.style.display = 'none';
-            });
-            document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper').forEach(el => {
-                el.style.display = 'none';
-            });
-            // 移除 body 上的 overflow:hidden (弹窗锁定滚动)
-            document.body.style.overflow = '';
-            document.body.classList.remove('el-popup-parent--hidden');
-            await sleep(200);
+            log('检测到错误弹窗, 清理中...');
+            dismissDialog(dialog);
+            await sleep(300);
 
             // 策略2: 缓存响应 + 重新点购买按钮
             setState({ cache: state.lastSuccess });
@@ -649,28 +661,29 @@
     }, true);
 
     function clickButton(btn) {
-        // 优先方案: 直接调用 Vue 组件的 gotoPayFn（绕过 disabled 限制）
+        // 非 disabled 按钮: 直接 DOM 点击（最可靠，前端正常处理响应）
+        if (!btn.disabled) {
+            log('DOM 点击按钮: ' + btn.textContent.trim());
+            btn.click();
+            return;
+        }
+
+        // disabled 按钮: 用 Vue gotoPayFn() 绕过限制
         let el = btn;
         for (let i = 0; i < 20 && el; i++) {
             if (el.__vue__ && el.__vue__.gotoPayFn) {
-                log('直接调用 Vue gotoPayFn()');
+                log('按钮 disabled, 调用 Vue gotoPayFn()');
                 el.__vue__.gotoPayFn();
                 return;
             }
             el = el.parentElement;
         }
 
-        // 降级方案: 强制解除 disabled + DOM 点击
-        log('未找到 Vue 实例, 降级为 DOM 点击');
-        if (btn.disabled) {
-            btn.disabled = false;
-            btn.classList.remove('is-disabled', 'disabled');
-        }
+        // 兜底: 强制解除 disabled + DOM 点击
+        log('强制解除 disabled + DOM 点击');
+        btn.disabled = false;
+        btn.classList.remove('is-disabled', 'disabled');
         btn.style.pointerEvents = 'auto';
-        btn.focus();
-        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
         btn.click();
     }
 
