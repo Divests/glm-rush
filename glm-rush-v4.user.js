@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.7
+// @version      4.8
 // @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
@@ -263,8 +263,7 @@
                     });
                     log(`成功! bizId=${winner.bizId} (第${winner.attempt}次)`);
                     recoveryAttempts = 0;
-                    // 不再自动调 autoRecover，由 startProactive 处理后续流程
-                    // autoRecover 的暴力清弹窗会把支付弹窗也关掉
+                    setTimeout(autoRecover, 500);
                     return { ok: true, text: winner.text, data: winner.data, status: winner.status };
                 }
 
@@ -363,20 +362,33 @@
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
 
-            // 有缓存 → 返回给前端（来自主动模式抢到后的 cache）
-            // 这是支付弹窗能弹出的关键: 前端发 preview → 拦截器返回缓存的成功响应 → 前端正常处理
+            // 已经成功过 → 直接返回缓存
+            if (state.status === 'success' && state.lastSuccess) {
+                log('已抢到, 返回成功响应');
+                return new Response(state.lastSuccess.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
+
+            // 有缓存 → 返回（来自主动模式成功后的恢复）
             if (state.cache) {
-                log('返回缓存的成功响应给前端');
+                log('返回缓存响应');
                 const c = state.cache;
                 setState({ cache: null });
                 recoveryAttempts = 0;
                 return new Response(c.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
             }
 
-            // 已经成功过，再次点击也返回成功响应
-            if (state.status === 'success' && state.lastSuccess) {
-                log('已抢到, 返回成功响应');
-                return new Response(state.lastSuccess.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
+            // 主动模式/正在抢购 → 进入重试引擎
+            if (state.proactive || state.status === 'retrying') {
+                log('抢购中, 启动重试...');
+                const result = await retry(url, {
+                    method: init?.method || 'POST',
+                    body: init?.body,
+                    headers: extractHeaders(init?.headers),
+                });
+                if (result.ok) {
+                    return new Response(result.text, { status: result.status, headers: { 'Content-Type': 'application/json' } });
+                }
+                return _fetch.apply(this, [input, init]);
             }
 
             // 普通捕获 → 只记录参数，放行原始请求，自动设定定时
@@ -428,19 +440,20 @@
                 return;
             }
 
-            // 有缓存 → 返回成功响应给前端
             if (state.cache) {
-                log('返回缓存的成功响应给前端 (XHR)');
+                log('返回缓存响应 (XHR)');
                 const c = state.cache; setState({ cache: null });
                 recoveryAttempts = 0;
                 fakeXHR(self, c.text);
                 return;
             }
 
-            // 已成功过 → 返回成功响应
-            if (state.status === 'success' && state.lastSuccess) {
-                log('已抢到, 返回成功响应 (XHR)');
-                fakeXHR(self, state.lastSuccess.text);
+            // 主动模式/正在抢购 → 重试
+            if (state.proactive || state.status === 'retrying') {
+                log('抢购中, 启动重试 (XHR)...');
+                retry(url, { method: this._m, body, headers: this._h || {} }).then(result => {
+                    fakeXHR(self, result.ok ? result.text : '{"code":-1,"msg":"重试失败"}');
+                });
                 return;
             }
 
@@ -514,41 +527,30 @@
         return true;
     }
 
-    /** 检查页面上是否有支付弹窗（不能关！）*/
-    function hasPaymentDialog() {
-        const paySelectors = '[class*="pay"], [class*="qrcode"], [class*="wechat"], [class*="alipay"], [class*="cashier"]';
-        for (const el of document.querySelectorAll(paySelectors)) {
-            if (el.offsetParent !== null || window.getComputedStyle(el).position === 'fixed') return true;
-        }
-        // 也检查 iframe（支付宝/微信支付可能用 iframe）
-        for (const iframe of document.querySelectorAll('iframe')) {
-            const src = iframe.src || '';
-            if (/alipay|wechat|wxpay|pay|cashier/i.test(src)) return true;
-        }
-        return false;
-    }
-
     async function autoRecover() {
         if (recovering || recoveryAttempts >= CFG.recoveryMax || !state.lastSuccess) return;
-
-        // 如果支付弹窗已经出现，不要干扰它！
-        if (hasPaymentDialog()) {
-            log('支付弹窗已出现, 跳过恢复');
-            return;
-        }
 
         recovering = true;
         recoveryAttempts++;
         try {
-            // 只关闭明确的错误弹窗，不暴力清理所有弹窗
+            // 策略1: 关闭所有弹窗/遮罩 (暴力清理)
             const dialog = findErrorDialog();
-            if (!dialog) {
-                log('无错误弹窗, 跳过恢复');
-                return;
+            if (dialog) {
+                log('检测到错误弹窗, 清理中...');
+                dismissDialog(dialog);
+                await sleep(300);
             }
-            log('检测到错误弹窗, 清理中...');
-            dismissDialog(dialog);
-            await sleep(300);
+            // 清理所有可能残留的遮罩层
+            document.querySelectorAll('.el-overlay, .v-modal, .el-overlay-dialog, [class*="overlay"], [class*="mask"]').forEach(el => {
+                el.style.display = 'none';
+            });
+            document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper').forEach(el => {
+                el.style.display = 'none';
+            });
+            // 移除 body 上的 overflow:hidden (弹窗锁定滚动)
+            document.body.style.overflow = '';
+            document.body.classList.remove('el-popup-parent--hidden');
+            await sleep(200);
 
             // 策略2: 缓存响应 + 重新点购买按钮
             setState({ cache: state.lastSuccess });
@@ -628,63 +630,18 @@
     // ═══════════════════════════════════════════
     //  主动抢购 & 定时
     // ═══════════════════════════════════════════
-    let _lastClickedBtn = null; // 记住用户点的那个按钮
-
     function findBuyButton() {
-        // 优先返回用户上次点击的同一个按钮
-        if (_lastClickedBtn && _lastClickedBtn.offsetParent !== null) return _lastClickedBtn;
-
-        // 按优先级查找: 特惠订阅 > 订阅升级 > 其他购买按钮
-        // 注意: 特惠按钮可能是 disabled 的，但我们会在 clickButton 里强制解除
-        const priority = ['特惠', '购买', '抢购', '下单'];
-        const candidates = [];
-        for (const el of document.querySelectorAll('button.buy-btn, button[class*="buy"], button')) {
+        // 优先找 buy-btn 类的按钮（特惠订阅/订阅升级）
+        for (const el of document.querySelectorAll('button.buy-btn')) {
             const t = el.textContent.trim();
-            if (/购买|抢购|立即|下单|特惠|订阅/.test(t) && t.length < 20 && el.offsetParent !== null) {
-                // 排除"即刻订阅"这类导航按钮和非购买按钮
-                if (/即刻订阅|暂不|取消|拼好模/.test(t)) continue;
-                const pIdx = priority.findIndex(p => t.includes(p));
-                candidates.push({ el, priority: pIdx >= 0 ? pIdx : 99 });
-            }
+            if (el.offsetParent !== null) return el;
         }
-        candidates.sort((a, b) => a.priority - b.priority);
-        return candidates.length > 0 ? candidates[0].el : null;
-    }
-
-    // 监听用户点击，记住是哪个按钮
-    document.addEventListener('click', e => {
-        const t = (e.target.textContent || '').trim();
-        if (/购买|抢购|立即|下单|特惠|订阅/.test(t) && t.length < 20) {
-            _lastClickedBtn = e.target.closest('button') || e.target;
-            log('记住按钮: ' + t);
+        // 降级：通用匹配，排除导航按钮
+        for (const el of document.querySelectorAll('button, [role="button"]')) {
+            const t = el.textContent.trim();
+            if (/购买|抢购|下单|特惠/.test(t) && t.length < 15 && el.offsetParent !== null) return el;
         }
-    }, true);
-
-    function clickButton(btn) {
-        // 非 disabled 按钮: 直接 DOM 点击（最可靠，前端正常处理响应）
-        if (!btn.disabled) {
-            log('DOM 点击按钮: ' + btn.textContent.trim());
-            btn.click();
-            return;
-        }
-
-        // disabled 按钮: 用 Vue gotoPayFn() 绕过限制
-        let el = btn;
-        for (let i = 0; i < 20 && el; i++) {
-            if (el.__vue__ && el.__vue__.gotoPayFn) {
-                log('按钮 disabled, 调用 Vue gotoPayFn()');
-                el.__vue__.gotoPayFn();
-                return;
-            }
-            el = el.parentElement;
-        }
-
-        // 兜底: 强制解除 disabled + DOM 点击
-        log('强制解除 disabled + DOM 点击');
-        btn.disabled = false;
-        btn.classList.remove('is-disabled', 'disabled');
-        btn.style.pointerEvents = 'auto';
-        btn.click();
+        return null;
     }
 
     async function startProactive() {
@@ -697,40 +654,23 @@
             log('已经抢到了, 不重复抢购');
             return;
         }
-
-        // 核心策略（与旧版一致，更可靠）:
-        // 1. 直接调 retry 抢 bizId（不依赖按钮点击）
-        // 2. 成功后把响应存入 cache
-        // 3. 点击购买按钮 → 前端发 preview → 拦截器返回 cache → 前端弹支付窗口
         setState({ proactive: true });
-        log('极速抢购启动! 直接请求模式...');
+        log(`极速抢购启动! 前${CFG.turboSec}秒${CFG.turboConcurrency}路并发, 之后${CFG.concurrency}路`);
 
         const { url, method, body, headers } = state.captured;
         const result = await retry(url, { method, body, headers });
         setState({ proactive: false });
 
         if (result.ok) {
-            // 存入 cache，等前端下一次 preview 请求时返回
             setState({ cache: { text: result.text, data: result.data } });
-            log('抢购成功! 触发购买流程...');
+            log('抢购成功! 触发支付...');
+            // 自动通知
             try { new Notification('GLM 抢购成功!', { body: `bizId=${state.bizId}` }); } catch {}
-
-            // 清理可能存在的错误弹窗
             const errDlg = findErrorDialog();
-            if (errDlg) {
-                dismissDialog(errDlg);
-                await sleep(300);
-            }
-
-            // 点击购买按钮 → 前端发 preview → 拦截器返回 cache → 前端弹支付窗口
+            if (errDlg) { dismissDialog(errDlg); await sleep(300); }
             const btn = findBuyButton();
-            if (btn) {
-                clickButton(btn);
-                log('已自动点击购买按钮, 等待支付窗口...');
-            } else {
-                log('未找到购买按钮, 请手动点击!');
-                alert('已抢到! 请立即点击「特惠订阅」按钮完成支付!');
-            }
+            if (btn) { btn.click(); log('已自动点击购买按钮'); }
+            else { alert('已获取到商品! 请立即点击购买按钮!'); }
         }
     }
 
