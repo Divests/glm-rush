@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.5
+// @version      4.6
 // @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
@@ -649,15 +649,24 @@
     }, true);
 
     function clickButton(btn) {
-        // 强制解除 disabled 状态（售罄按钮需要解锁才能触发事件）
+        // 优先方案: 直接调用 Vue 组件的 gotoPayFn（绕过 disabled 限制）
+        let el = btn;
+        for (let i = 0; i < 20 && el; i++) {
+            if (el.__vue__ && el.__vue__.gotoPayFn) {
+                log('直接调用 Vue gotoPayFn()');
+                el.__vue__.gotoPayFn();
+                return;
+            }
+            el = el.parentElement;
+        }
+
+        // 降级方案: 强制解除 disabled + DOM 点击
+        log('未找到 Vue 实例, 降级为 DOM 点击');
         if (btn.disabled) {
             btn.disabled = false;
             btn.classList.remove('is-disabled', 'disabled');
-            log('已解除按钮 disabled 状态');
         }
-        // 确保 pointer-events 可交互
         btn.style.pointerEvents = 'auto';
-        // 多种方式触发点击，确保前端框架（Vue/Element UI）能响应
         btn.focus();
         btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
         btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));

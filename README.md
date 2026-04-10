@@ -1,4 +1,4 @@
-# GLM Coding 抢购助手 v4.5
+# GLM Coding 抢购助手 v4.6
 
 智谱 GLM Coding Plan 限时抢购自动化脚本（Tampermonkey 油猴脚本）
 
@@ -86,6 +86,10 @@
 ```
 
 ## 更新日志
+
+### v4.6 (2026-04-10)
+- **修复** clickButton 直接调用 Vue 组件的 `gotoPayFn()` 方法，彻底绕过 disabled 按钮限制
+- **验证** Playwright 实测确认 `gotoPayFn()` 能触发完整的 preview + check 流程
 
 ### v4.5 (2026-04-10)
 - **修复** 支付弹窗不弹出的核心问题：改用"先抢再喂"策略，retry 独立抢到 bizId 后缓存响应，再点击按钮让前端正常处理
