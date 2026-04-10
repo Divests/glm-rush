@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.5
+// @version      4.6
 // @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
@@ -119,6 +119,7 @@
         visited.add(obj);
         if (obj.isSoldOut === true) obj.isSoldOut = false;
         if (obj.soldOut === true) obj.soldOut = false;
+        if (obj.isServerBusy === true) obj.isServerBusy = false;
         if (obj.disabled === true && (obj.price !== undefined || obj.productId || obj.title)) obj.disabled = false;
         if (obj.stock === 0) obj.stock = 999;
         for (const k of Object.keys(obj)) {
@@ -507,22 +508,17 @@
     }
 
     function dismissDialog(dialog) {
-        // 关闭按钮
+        // 只在传入的 dialog 内部查找关闭按钮，不 fallback 到 document（避免关掉支付弹窗）
         for (const sel of ['.el-dialog__headerbtn', '.el-message-box__headerbtn', '.ant-modal-close', '[aria-label="Close"]', '[aria-label="close"]']) {
-            const btn = dialog.querySelector(sel) || document.querySelector(sel);
+            const btn = dialog.querySelector(sel);
             if (btn && btn.offsetParent !== null) { btn.click(); return true; }
         }
-        // 确定/取消按钮
+        // 确定/取消按钮（仅 dialog 内部）
         for (const btn of dialog.querySelectorAll('button, [role="button"]')) {
             const t = (btn.textContent || '').trim();
             if (/关闭|确定|取消|知道了|OK|Cancel|Close|确认/.test(t) && t.length < 10) { btn.click(); return true; }
         }
-        // Escape
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
-        // 遮罩
-        for (const mask of document.querySelectorAll('.el-overlay, .v-modal, [class*="overlay"], [class*="mask"]')) {
-            if (mask.offsetParent !== null || window.getComputedStyle(mask).position === 'fixed') { mask.click(); return true; }
-        }
+        // 直接隐藏这个 dialog
         dialog.style.display = 'none';
         return true;
     }
@@ -530,27 +526,23 @@
     async function autoRecover() {
         if (recovering || recoveryAttempts >= CFG.recoveryMax || !state.lastSuccess) return;
 
+        // 如果页面上有支付相关弹窗，不要干扰
+        const payEl = document.querySelector('[class*="pay"], [class*="qrcode"], [class*="wechat"], [class*="alipay"], [class*="cashier"], iframe[src*="pay"]');
+        if (payEl && (payEl.offsetParent !== null || window.getComputedStyle(payEl).position === 'fixed')) {
+            log('支付弹窗已出现, 跳过恢复');
+            return;
+        }
+
+        // 只处理明确的错误弹窗，不暴力清理所有弹窗
+        const dialog = findErrorDialog();
+        if (!dialog) return;
+
         recovering = true;
         recoveryAttempts++;
         try {
-            // 策略1: 关闭所有弹窗/遮罩 (暴力清理)
-            const dialog = findErrorDialog();
-            if (dialog) {
-                log('检测到错误弹窗, 清理中...');
-                dismissDialog(dialog);
-                await sleep(300);
-            }
-            // 清理所有可能残留的遮罩层
-            document.querySelectorAll('.el-overlay, .v-modal, .el-overlay-dialog, [class*="overlay"], [class*="mask"]').forEach(el => {
-                el.style.display = 'none';
-            });
-            document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper').forEach(el => {
-                el.style.display = 'none';
-            });
-            // 移除 body 上的 overflow:hidden (弹窗锁定滚动)
-            document.body.style.overflow = '';
-            document.body.classList.remove('el-popup-parent--hidden');
-            await sleep(200);
+            log('检测到错误弹窗, 清理中...');
+            dismissDialog(dialog);
+            await sleep(300);
 
             // 策略2: 缓存响应 + 重新点购买按钮
             setState({ cache: state.lastSuccess });
@@ -671,6 +663,10 @@
             const btn = findBuyButton();
             if (btn) { btn.click(); log('已自动点击购买按钮'); }
             else { alert('已获取到商品! 请立即点击购买按钮!'); }
+
+            // 兜底: 如果 fakeXHR 没能弹出支付窗口, 直接设置 Vue 数据
+            await sleep(1500);
+            forcePayDialog(result.data);
         }
     }
 
@@ -828,6 +824,63 @@
     });
 
     // ═══════════════════════════════════════════
+    //  Vue isServerBusy 兜底 patch
+    // ═══════════════════════════════════════════
+    function patchVueServerBusy() {
+        let attempts = 0;
+        const tid = setInterval(() => {
+            attempts++;
+            if (attempts > 30) { clearInterval(tid); return; } // 15秒后放弃
+            const app = document.querySelector('#app');
+            const vue = app && app.__vue__;
+            if (!vue) return;
+            let patched = 0;
+            const walk = (vm, depth) => {
+                if (depth > 8) return;
+                if (vm.$data && vm.$data.isServerBusy === true) {
+                    vm.isServerBusy = false;
+                    patched++;
+                }
+                for (const child of (vm.$children || [])) walk(child, depth + 1);
+            };
+            walk(vue, 0);
+            if (patched > 0) {
+                log(`已解除 isServerBusy (${patched}个组件)`);
+                clearInterval(tid);
+            }
+        }, 500);
+    }
+
+    /** 兜底: 直接操作 Vue 组件弹出支付窗口 */
+    function forcePayDialog(responseData) {
+        const app = document.querySelector('#app');
+        const vue = app && app.__vue__;
+        if (!vue) return;
+
+        let payComp = null;
+        const findComp = (vm, depth) => {
+            if (depth > 8) return;
+            if (vm.$data && 'payDialogVisible' in vm.$data) { payComp = vm; return; }
+            for (const child of (vm.$children || [])) { findComp(child, depth + 1); if (payComp) return; }
+        };
+        findComp(vue, 0);
+        if (!payComp) { log('未找到支付组件'); return; }
+
+        // 已经弹出了就不干预
+        if (payComp.payDialogVisible) { log('支付弹窗已显示'); return; }
+
+        // 设置 priceData 和 payDialogVisible
+        const data = responseData && responseData.data;
+        if (data) {
+            payComp.priceData = data;
+            payComp.payDialogVisible = true;
+            log('兜底: 已直接设置 payDialogVisible=true');
+        } else {
+            log('兜底: 响应数据无 data 字段, 无法设置');
+        }
+    }
+
+    // ═══════════════════════════════════════════
     //  浮动面板 (Shadow DOM)
     // ═══════════════════════════════════════════
     function createPanel() {
@@ -872,7 +925,7 @@
 .keys{font-size:10px;color:#636e72;text-align:center;margin-top:6px}
 </style>
 <div class="panel">
-  <div class="hd" id="drag"><b>GLM v4.4</b><button class="mn" id="min">-</button></div>
+  <div class="hd" id="drag"><b>GLM v4.6</b><button class="mn" id="min">-</button></div>
   <div class="bd" id="bd">
     <div class="st st-idle" id="st">等待中</div>
     <div class="cap" id="cap">${state.captured ? '已恢复上次捕获的请求' : '请先点一次购买按钮'}</div>
@@ -933,9 +986,12 @@
         // 闭包引用供 refreshUI 使用
         _shadowRef = shadow;
 
-        log('v4.4 已加载 (极速并发+时间同步+全自动抢购)');
+        log('v4.5 已加载 (极速并发+时间同步+全自动抢购)');
         if (state.captured) log('已恢复上次捕获的请求参数, 可直接设定时间');
         setupDialogWatcher();
+
+        // 兜底: 定时 patch Vue 组件的 isServerBusy (batch-preview 可能在脚本前加载)
+        patchVueServerBusy();
 
         // 自动同步服务器时间
         syncServerTime();
