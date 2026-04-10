@@ -1,4 +1,4 @@
-# GLM Coding 抢购助手 v4.5
+# GLM Coding 抢购助手 v4.6
 
 智谱 GLM Coding Plan 限时抢购自动化脚本（Tampermonkey 油猴脚本）
 
@@ -86,6 +86,12 @@
 ```
 
 ## 更新日志
+
+### v4.6 (2026-04-10)
+- **修复** 支付弹窗不弹出 — 根因: 前端 `payComponent.isServerBusy=true` 阻止 `payPreviewFn` 发请求
+- **新增** `patchSoldOut` 增加 `isServerBusy` 拦截（JSON.parse 层）
+- **新增** `patchVueServerBusy` 兜底：定时扫描 Vue 组件树，直接 patch `isServerBusy=false`
+- **新增** `forcePayDialog` 兜底：抢购成功 1.5s 后若弹窗未出现，直接设置 Vue `payDialogVisible=true`
 
 ### v4.5 (2026-04-10)
 - **修复** `findBuyButton` 找错按钮（匹配到"即刻订阅"导航按钮），优先找 `buy-btn` 类按钮
