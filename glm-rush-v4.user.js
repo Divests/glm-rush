@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.6
+// @version      4.9
 // @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
@@ -85,6 +85,88 @@
     const rand = (min, max) => min + Math.random() * (max - min);
     const jitteredDelay = base => Math.round(base * (1 + (Math.random() * 2 - 1) * CFG.jitter));
 
+    // ═══════════════════════════════════════════
+    //  验证码 (队列 + 后台预热)
+    // ═══════════════════════════════════════════
+    const CAPTCHA_APP_ID = '196026326';
+    let captchaQueue = [];          // { ticket, randstr, ts }
+    let captchaSolving = false;     // 是否正在解验证码
+    const CAPTCHA_VALID_MS = 4 * 60 * 1000; // 4分钟有效期（留1分钟余量）
+
+    async function ensureCaptchaSDK() {
+        if (typeof TencentCaptcha === 'undefined') {
+            await new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = 'https://turing.captcha.gtimg.com/turing.js';
+                s.onload = resolve;
+                s.onerror = () => reject(new Error('验证码SDK加载失败'));
+                document.head.appendChild(s);
+            });
+        }
+    }
+
+    async function doCaptcha() {
+        await ensureCaptchaSDK();
+        return new Promise(resolve => {
+            try {
+                const captcha = new TencentCaptcha(CAPTCHA_APP_ID, function(res) {
+                    if (res.ret === 0) {
+                        resolve({ ticket: res.ticket, randstr: res.randstr });
+                    } else {
+                        resolve({ ticket: '', randstr: '' });
+                    }
+                });
+                captcha.show();
+            } catch (e) {
+                resolve({ ticket: '', randstr: '' });
+            }
+        });
+    }
+
+    // 取一个有效的 ticket（过期自动丢弃）
+    function dequeueCaptcha() {
+        const now = Date.now();
+        while (captchaQueue.length > 0) {
+            const item = captchaQueue[0];
+            if (now - item.ts > CAPTCHA_VALID_MS) {
+                captchaQueue.shift();
+                continue;
+            }
+            return captchaQueue.shift();
+        }
+        return null;
+    }
+
+    // 后台弹验证码（不阻塞重试循环）
+    function backgroundSolveCaptcha() {
+        if (captchaSolving) return;
+        captchaSolving = true;
+        doCaptcha().then(result => {
+            captchaSolving = false;
+            if (result.ticket) {
+                captchaQueue.push({ ...result, ts: Date.now() });
+                log(`验证码完成, 队列中有 ${captchaQueue.length} 个ticket`);
+            }
+        }).catch(() => { captchaSolving = false; });
+    }
+
+    // 定时预热验证码（抢购前 5 分钟开始，每 30 秒弹一次）
+    let preheatTimer = null;
+    function startCaptchaPreheat() {
+        if (preheatTimer) return;
+        log('验证码预热启动 (每30秒弹一次)');
+        preheatTimer = setInterval(() => {
+            if (captchaSolving) return;
+            if (captchaQueue.length >= 3) return; // 队列满了不弹
+            log('预热验证码... 请快速完成');
+            backgroundSolveCaptcha();
+        }, 30000);
+    }
+
+    function stopCaptchaPreheat() {
+        if (preheatTimer) { clearInterval(preheatTimer); preheatTimer = null; }
+    }
+
     function getDelay(attempt) {
         if (attempt <= CFG.burstCount) return 0;
         if (attempt <= 50) return jitteredDelay(CFG.fastDelay);
@@ -152,7 +234,30 @@
             const q = (0.5 + Math.random() * 0.5).toFixed(1);
             randHeaders['Accept-Language'] = `zh-CN,zh;q=${q},en;q=${(q * 0.7).toFixed(1)}`;
 
-            const resp = await _fetch(url, { ...opts, headers: randHeaders, credentials: 'include' });
+            // 重放时去掉一次性验证码凭据，避免用旧 ticket 被拒
+            let reqBody = opts.body;
+            if (reqBody && typeof reqBody === 'string') {
+                try {
+                    const bodyObj = _parse(reqBody);
+                    if (bodyObj.ticket || bodyObj.randstr) {
+                        const clean = { ...bodyObj };
+                        delete clean.ticket;
+                        delete clean.randstr;
+                        reqBody = JSON.stringify(clean);
+                    }
+                } catch {}
+            }
+
+            // 如果队列里有有效 ticket，带上
+            const cachedTicket = dequeueCaptcha();
+            if (cachedTicket) {
+                try {
+                    const bodyObj = _parse(reqBody || '{}');
+                    reqBody = JSON.stringify({ ...bodyObj, ticket: cachedTicket.ticket, randstr: cachedTicket.randstr });
+                } catch {}
+            }
+
+            const resp = await _fetch(url, { ...opts, body: reqBody, headers: randHeaders, credentials: 'include', priority: 'high' });
 
             // HTTP 状态码检测
             if (resp.status === 401 || resp.status === 403) {
@@ -169,7 +274,7 @@
             if (data && data.code === 200 && data.data && data.data.bizId) {
                 const bizId = data.data.bizId;
 
-                // check 校验
+                // check 校验（异步，不阻塞其他并发请求）
                 try {
                     const checkUrl = `${location.origin}${CFG.CHECK}?bizId=${encodeURIComponent(bizId)}`;
                     const checkResp = await _fetch(checkUrl, { credentials: 'include' });
@@ -184,8 +289,15 @@
                     // 通过!
                     return { ok: true, text, data, bizId, status: resp.status, attempt: attemptNum };
                 } catch (e) {
-                    return { ok: false, reason: `check异常: ${e.message}`, attempt: attemptNum };
+                    // check 失败不丢弃 bizId，直接返回成功（让后续流程处理）
+                    return { ok: true, text, data, bizId, status: resp.status, attempt: attemptNum };
                 }
+            }
+
+            // 需要验证码 → 触发验证码流程
+            const msg = (data && data.msg) || '';
+            if (data && (msg.includes('验证') || msg.includes('安全') || msg.includes('captcha') || msg.includes('ticket'))) {
+                return { ok: false, reason: '需要验证码', needCaptcha: true, attempt: attemptNum };
             }
 
             const reason = !data ? '非JSON'
@@ -212,130 +324,154 @@
             setState({ status: 'retrying', count: 0, stats: { ...state.stats, startTime: performance.now() } });
 
             let totalAttempt = 0;
-            let consecutiveErrors = 0;
+            let consecutiveNetworkErrors = 0;
             let throttleCount = 0;
             let consecutiveSoldOut = 0;
+            let adaptiveConcurrency = CFG.concurrency; // 自适应并发数
+            let lastBatchReasons = []; // 上一批失败原因
 
-            while (totalAttempt < CFG.maxRetry && !stopRequested) {
-                // 极速模式: 前N秒用更高并发
-                const elapsedMs = performance.now() - state.stats.startTime;
-                const isTurbo = elapsedMs < CFG.turboSec * 1000;
-                const curConcurrency = isTurbo ? CFG.turboConcurrency : CFG.concurrency;
-                const batchSize = Math.min(curConcurrency, CFG.maxRetry - totalAttempt);
-                const controllers = [];
-                const promises = [];
+            // ═══ 持续补充模式 ═══
+            // 保持固定数量的请求在飞，一个返回就补一个，不浪费任何时间
+            const maxInFlight = CFG.turboConcurrency; // 最大在飞请求数
+            let inFlight = 0;       // 当前在飞数量
+            let settled = false;    // 是否已成功
+            let winnerResult = null;
 
-                for (let j = 0; j < batchSize; j++) {
-                    totalAttempt++;
-                    const ac = new AbortController();
-                    controllers.push(ac);
-                    promises.push(
-                        singleAttempt(url, { ...opts, signal: ac.signal }, totalAttempt)
-                    );
-                }
+            const enqueue = () => {
+                if (settled || stopRequested || totalAttempt >= CFG.maxRetry) return;
+                if (inFlight >= maxInFlight) return;
 
-                setState({ count: totalAttempt });
+                totalAttempt++;
+                inFlight++;
 
-                // 任一成功即取消其余
-                const winner = await new Promise(resolve => {
-                    let settled = false;
-                    let doneCount = 0;
-                    promises.forEach((p, idx) => {
-                        p.then(r => {
-                            if (r.ok && !settled) {
-                                settled = true;
-                                controllers.forEach((ac, i) => { if (i !== idx) try { ac.abort(); } catch {} });
-                                resolve(r);
+                // 错开请求：在极速窗口内，每个请求延迟 0~10ms 随机间隔
+                const stagger = (performance.now() - state.stats.startTime < CFG.turboSec * 1000)
+                    ? Math.random() * 10 : 0;
+
+                setTimeout(() => {
+                    if (settled || stopRequested) { inFlight--; return; }
+                    singleAttempt(url, { ...opts }, totalAttempt).then(result => {
+                        inFlight--;
+                        if (settled) return;
+
+                        if (result.ok) {
+                            // 成功！
+                            settled = true;
+                            winnerResult = result;
+                        } else {
+                            // 分析失败原因
+                            lastBatchReasons.push(result.reason || '未知');
+
+                            // 触发验证码
+                            if (result.needCaptcha) {
+                                backgroundSolveCaptcha();
                             }
-                            if (++doneCount === promises.length && !settled) resolve(null);
-                        });
-                    });
-                });
 
-                // 收集失败原因 (用于日志)
-                const results = await Promise.all(promises.map(p => p.catch(() => ({ ok: false, reason: '已取消' }))));
+                            // 自适应并发调整
+                            if (result.reason && result.reason.includes('429')) {
+                                throttleCount++;
+                                adaptiveConcurrency = Math.max(2, adaptiveConcurrency - 5);
+                            } else if (result.reason === '售罄' || result.reason === '系统繁忙') {
+                                // 服务器正常响应，可以加码
+                                throttleCount = 0;
+                                adaptiveConcurrency = Math.min(maxInFlight, adaptiveConcurrency + 1);
+                            }
 
-                if (winner) {
-                    setState({
-                        status: 'success',
-                        bizId: winner.bizId,
-                        lastSuccess: { text: winner.text, data: winner.data },
-                        stats: { ...state.stats, total: totalAttempt, success: state.stats.success + 1 },
-                    });
-                    log(`成功! bizId=${winner.bizId} (第${winner.attempt}次)`);
-                    recoveryAttempts = 0;
-                    setTimeout(autoRecover, 500);
-                    return { ok: true, text: winner.text, data: winner.data, status: winner.status };
-                }
+                            // 会话过期
+                            if (result.reason && result.reason.includes('会话过期')) {
+                                log('会话已过期, 请重新登录!', 'error');
+                                setState({ status: 'failed' });
+                                stopRequested = true;
+                                return;
+                            }
+                        }
 
-                // 统计错误
-                const failedResults = results.filter(r => !r.ok);
-                const reasons = failedResults.map(r => r.reason || '未知');
-                setState({ stats: { ...state.stats, errors: state.stats.errors + failedResults.length } });
+                        // 补充一个新请求（持续补充核心）
+                        enqueue();
+                    }).catch(() => { inFlight--; enqueue(); });
 
-                const networkErrors = reasons.filter(r => r.startsWith('网络')).length;
-                consecutiveErrors = networkErrors === batchSize ? consecutiveErrors + 1 : 0;
+                    setState({ count: totalAttempt });
+                }, stagger);
+            };
 
-                // 连续网络错误 → 暂停
-                if (consecutiveErrors >= 3) {
-                    log('网络异常, 暂停3秒...');
-                    await sleep(3000);
-                    consecutiveErrors = 0;
-                }
+            // 初始填满：一次性发射 maxInFlight 个请求
+            for (let i = 0; i < maxInFlight; i++) {
+                enqueue();
+            }
 
-                // 会话过期检测
-                if (reasons.some(r => r.includes('会话过期'))) {
-                    log('会话已过期, 请重新登录!', 'error');
-                    setState({ status: 'failed' });
-                    return { ok: false };
-                }
+            // ═══ 主循环：等待结果 + 定期分析 ═══
+            while (!settled && !stopRequested && totalAttempt < CFG.maxRetry) {
+                await sleep(100); // 每 100ms 检查一次
 
-                // 限流检测 (独立计数)
-                if (reasons.some(r => r.includes('429') || r.includes('限流'))) {
-                    throttleCount++;
-                    const backoff = Math.min(2000 * (2 ** Math.min(throttleCount, 4)), 16000);
-                    log(`限流, 退避${backoff}ms...`, 'warn');
-                    await sleep(backoff);
-                } else {
-                    throttleCount = 0;
-                }
+                // 定期分析失败原因
+                if (lastBatchReasons.length >= 20) {
+                    const reasons = lastBatchReasons.splice(0, 20); // 取出最近 20 个
 
-                // EXPIRE → 立即重试不等待
-                if (reasons.every(r => r === 'EXPIRE')) continue;
+                    // 连续网络错误
+                    const networkErrors = reasons.filter(r => r.startsWith('网络')).length;
+                    if (networkErrors >= 15) {
+                        consecutiveNetworkErrors++;
+                        if (consecutiveNetworkErrors >= 3) {
+                            log('网络异常, 暂停3秒...');
+                            await sleep(3000);
+                            consecutiveNetworkErrors = 0;
+                        }
+                    } else {
+                        consecutiveNetworkErrors = 0;
+                    }
 
-                // 前20秒全速冲，之后才考虑降速
-                const elapsedSec = (performance.now() - state.stats.startTime) / 1000;
+                    // 限流退避
+                    if (reasons.some(r => r.includes('429') || r.includes('限流'))) {
+                        const backoff = Math.min(2000 * (2 ** Math.min(throttleCount, 4)), 16000);
+                        log(`限流, 退避${backoff}ms... (并发降至 ${adaptiveConcurrency})`, 'warn');
+                        await sleep(backoff);
+                    }
 
-                if (elapsedSec > 20) {
-                    // 超过20秒 — 检测是否该降速
-                    const soldOutCount = reasons.filter(r => r === '售罄').length;
-                    if (soldOutCount === batchSize) {
+                    // 售罄降速（20秒后检测）
+                    const elapsedSec = (performance.now() - state.stats.startTime) / 1000;
+                    if (elapsedSec > 20 && reasons.every(r => r === '售罄')) {
                         consecutiveSoldOut++;
+                        if (consecutiveSoldOut >= 10) {
+                            if (consecutiveSoldOut === 10) log('连续售罄, 可能已抢完, 降速...');
+                            await sleep(2000);
+                        }
                     } else {
                         consecutiveSoldOut = 0;
                     }
-                    // 连续10轮全售罄 → 可能已经抢完了
-                    if (consecutiveSoldOut >= 10) {
-                        if (consecutiveSoldOut === 10) log('连续售罄, 可能已抢完, 降速 (2s)...');
-                        await sleep(2000);
-                        continue;
+
+                    // 验证码触发
+                    const captchaCount = reasons.filter(r => r === '需要验证码').length;
+                    if (captchaCount > 10) {
+                        log(`${captchaCount}/20 需要验证码, 并发降至 ${adaptiveConcurrency}`, 'warn');
+                        adaptiveConcurrency = Math.max(2, Math.floor(adaptiveConcurrency / 2));
                     }
-                }
 
-                // 日志 (前5次 + 每20次)
-                if (totalAttempt <= 5 * CFG.concurrency || totalAttempt % (20 * CFG.concurrency) === 0) {
+                    // 日志
                     const sec = elapsedSec.toFixed(0);
-                    log(`#${totalAttempt} ${reasons[0]} (${sec}s)`);
+                    log(`#${totalAttempt} ${reasons[0]} 并发:${adaptiveConcurrency} 在飞:${inFlight} (${sec}s)`);
                 }
+            }
 
-                // 自适应延迟
-                const d = getDelay(totalAttempt / CFG.concurrency);
-                if (d > 0) await sleep(d);
+            // ═══ 结果处理 ═══
+            if (winnerResult) {
+                setState({
+                    status: 'success',
+                    bizId: winnerResult.bizId,
+                    lastSuccess: { text: winnerResult.text, data: winnerResult.data },
+                    stats: { ...state.stats, total: totalAttempt, success: state.stats.success + 1 },
+                });
+                log(`成功! bizId=${winnerResult.bizId} (第${winnerResult.attempt}次, 并发峰值${maxInFlight})`);
+                stopCaptchaPreheat();
+                recoveryAttempts = 0;
+                setTimeout(autoRecover, 500);
+                return { ok: true, text: winnerResult.text, data: winnerResult.data, status: winnerResult.status };
             }
 
             if (!stopRequested) {
                 setState({ status: 'failed' });
                 log(`达到上限 ${CFG.maxRetry} 次`);
+            } else if (lastBatchReasons.some(r => r.includes('会话过期'))) {
+                // 已在上面处理
             } else {
                 setState({ status: 'idle' });
             }
@@ -392,8 +528,28 @@
                 return _fetch.apply(this, [input, init]);
             }
 
-            // 普通捕获 → 只记录参数，放行原始请求，自动设定定时
-            log('已捕获请求参数, 等待抢购时间...');
+            // 普通捕获 → 清理一次性凭据后记录参数，放行原始请求，自动设定定时
+            let cleanBody = init?.body;
+            if (cleanBody && typeof cleanBody === 'string') {
+                try {
+                    const bodyObj = _parse(cleanBody);
+                    if (bodyObj.ticket || bodyObj.randstr) {
+                        const clean = { ...bodyObj };
+                        delete clean.ticket;
+                        delete clean.randstr;
+                        cleanBody = JSON.stringify(clean);
+                    }
+                } catch {}
+            }
+            const capturedClean = {
+                url,
+                method: init?.method || 'POST',
+                body: cleanBody,
+                headers: extractHeaders(init?.headers),
+            };
+            setState({ captured: capturedClean });
+            try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(capturedClean)); } catch {}
+            log('已捕获请求参数(已清理验证码凭据), 等待抢购时间...');
             autoScheduleIfNeeded();
             return _fetch.apply(this, [input, init]);
         }
@@ -759,7 +915,7 @@
         const ms = target.getTime() - getServerNow();
         log(`定时: ${timeStr} (${Math.ceil(ms / 1000)}秒后, 北京时间)`);
 
-        // 提前3秒自动预热
+        // 提前3秒自动预热TCP
         if (ms > 4000) {
             setTimeout(() => {
                 log('定时前3秒, 自动预热...');
@@ -767,7 +923,18 @@
             }, Math.max(0, ms - 3000));
         }
 
-        // 精确等待: 用 setInterval 10ms 检查, 到时间立即启动
+        // 提前5分钟启动验证码预热
+        if (ms > 5 * 60 * 1000) {
+            setTimeout(() => {
+                startCaptchaPreheat();
+            }, Math.max(0, ms - 5 * 60 * 1000));
+        } else if (ms > 30000) {
+            // 不足5分钟但超过30秒，立即启动
+            startCaptchaPreheat();
+        }
+
+        // 精确等待: 提前 RTT/2 启动，让请求恰好在整点到达服务端
+        const rttAdvance = Math.max(Math.round(Math.abs(serverTimeOffset) * 2), 50); // 至少提前 50ms
         const tid = setInterval(() => {
             const remaining = target.getTime() - getServerNow();
             // 更新面板倒计时
@@ -776,12 +943,12 @@
                 const timerEl = _shadowRef?.getElementById('timer-info');
                 if (timerEl) timerEl.textContent = `-${sec}s`;
             }
-            if (remaining <= 0) {
+            if (remaining <= rttAdvance) {
                 clearInterval(tid);
                 setState({ timerId: null });
                 const timerEl = _shadowRef?.getElementById('timer-info');
                 if (timerEl) timerEl.textContent = '';
-                log('时间到! 自动启动抢购!');
+                log(`时间到! 提前${rttAdvance}ms启动 (补偿网络延迟)`);
                 startProactive();
             }
         }, 10);
@@ -789,21 +956,23 @@
         setState({ timerId: tid });
     }
 
-    // 预热
+    // 预热（增强版：并发建立更多连接）
     async function preheat() {
         try {
             log('TCP预热中...');
-            // 连发3次预热请求，确保连接池暖好
-            for (let i = 0; i < 3; i++) {
-                await _fetch(location.origin + '/api/biz/pay/check?bizId=preheat_' + i, { credentials: 'include' }).catch(() => {});
-                await sleep(200);
+            const promises = [];
+            for (let i = 0; i < 10; i++) {
+                promises.push(
+                    _fetch(location.origin + CFG.CHECK + '?bizId=preheat_' + i, { credentials: 'include', priority: 'high' }).catch(() => {})
+                );
             }
-            // 也预热 preview 的 DNS + TCP (用 HEAD 请求不产生副作用)
-            await _fetch(location.origin + CFG.PREVIEW, {
-                method: 'HEAD',
-                credentials: 'include',
-            }).catch(() => {});
-            log('预热完成 (4次连接已建立)');
+            for (let i = 0; i < 3; i++) {
+                promises.push(
+                    _fetch(location.origin + CFG.PREVIEW, { method: 'HEAD', credentials: 'include' }).catch(() => {})
+                );
+            }
+            await Promise.all(promises);
+            log('预热完成 (13个连接已建立)');
         } catch { log('预热部分失败，不影响使用'); }
     }
 
@@ -986,7 +1155,7 @@
         // 闭包引用供 refreshUI 使用
         _shadowRef = shadow;
 
-        log('v4.5 已加载 (极速并发+时间同步+全自动抢购)');
+        log('v4.9 已加载 (持续补充+自适应并发+提前量+验证码队列)');
         if (state.captured) log('已恢复上次捕获的请求参数, 可直接设定时间');
         setupDialogWatcher();
 
