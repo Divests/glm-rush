@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 v4.0
 // @namespace    http://tampermonkey.net/
-// @version      4.10
-// @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化 + AbortController + 多标签页协同
+// @version      4.12-debug
+// @description  并发重试 + 自适应间隔 + 反检测 + check校验 + 弹窗恢复 + 定时触发 + 配置持久化 + AbortController + 多标签页协同 + 状态增强 + 调试日志
 // @author       Assistant
 // @match        *://www.bigmodel.cn/*
 // @match        *://bigmodel.cn/*
@@ -46,6 +46,30 @@
     const CFG = loadCfg();
 
     // ═══════════════════════════════════════════
+    //  调试模式
+    // ═══════════════════════════════════════════
+    const DEBUG = true;
+    // 详细日志采样：前 N 次每次都打，之后每 10 次打一次
+    const DEBUG_DETAIL_FIRST_N = 5;
+    const DEBUG_SAMPLE_INTERVAL = 10;
+
+    function dbgLog(msg) {
+        if (!DEBUG) return;
+        const entry = { ts: ts(), msg: '[DBG] ' + msg, level: 'warn' };
+        const logs = [...state.logs, entry];
+        if (logs.length > CFG.logMax) logs.splice(0, logs.length - CFG.logMax);
+        state = { ...state, logs };
+        console.log(`%c[GLM-DBG] ${msg}`, 'color:#fdcb6e');
+        appendLogDOM(entry);
+    }
+
+    /** 安全截断字符串 */
+    function truncate(s, maxLen = 300) {
+        if (!s) return '(empty)';
+        return s.length > maxLen ? s.substring(0, maxLen) + `...(${s.length}字)` : s;
+    }
+
+    // ═══════════════════════════════════════════
     //  状态 (不可变更新)
     // ═══════════════════════════════════════════
     let state = {
@@ -62,8 +86,35 @@
     };
 
     function setState(patch) {
+        const prevStatus = state.status;
         state = { ...state, ...patch };
+        // 状态变化时触发增强反馈
+        if (patch.status && patch.status !== prevStatus) {
+            onStatusChange(prevStatus, patch.status);
+        }
         refreshUI();
+    }
+
+    function onStatusChange(from, to) {
+        if (to === 'retrying') {
+            playSound('start');
+            updateTopBar({ text: '⚡ 抢购已启动！正在并发请求中...', bg: '#e17055' });
+            updateTitle('retrying', '0次');
+        } else if (to === 'success') {
+            playSound('success');
+            updateTopBar({ text: `✅ 抢购成功! bizId=${state.bizId}`, bg: '#00b894' });
+            updateTitle('success', `bizId=${state.bizId}`);
+            // 5秒后自动隐藏横幅
+            setTimeout(() => updateTopBar({ text: '' }), 5000);
+        } else if (to === 'failed') {
+            playSound('fail');
+            updateTopBar({ text: `❌ 抢购失败 (${state.count}次)`, bg: '#d63031' });
+            updateTitle('failed', `${state.count}次`);
+            setTimeout(() => updateTopBar({ text: '' }), 8000);
+        } else if (to === 'idle') {
+            updateTopBar({ text: '' });
+            updateTitle('idle');
+        }
     }
 
     // 恢复上次捕获的请求
@@ -126,14 +177,19 @@
     // 取一个有效的 ticket（过期自动丢弃）
     function dequeueCaptcha() {
         const now = Date.now();
+        let expired = 0;
         while (captchaQueue.length > 0) {
             const item = captchaQueue[0];
             if (now - item.ts > CAPTCHA_VALID_MS) {
                 captchaQueue.shift();
+                expired++;
                 continue;
             }
-            return captchaQueue.shift();
+            const ticket = captchaQueue.shift();
+            if (DEBUG) dbgLog(`取出ticket (过期丢弃:${expired} 队列剩余:${captchaQueue.length})`);
+            return ticket;
         }
+        if (expired > 0) dbgLog(`⚠️ 丢弃了${expired}个过期ticket, 队列已空`);
         return null;
     }
 
@@ -225,6 +281,7 @@
     let _retryLock = null;
 
     async function singleAttempt(url, opts, attemptNum) {
+        const shouldDetail = DEBUG && (attemptNum <= DEBUG_DETAIL_FIRST_N || attemptNum % DEBUG_SAMPLE_INTERVAL === 0);
         try {
             // 请求指纹随机化 — 每次请求看起来不一样，降低被识别为脚本的概率
             const randHeaders = { ...opts.headers };
@@ -236,6 +293,7 @@
 
             // 重放时去掉一次性验证码凭据，避免用旧 ticket 被拒
             let reqBody = opts.body;
+            let bodyModified = false;
             if (reqBody && typeof reqBody === 'string') {
                 try {
                     const bodyObj = _parse(reqBody);
@@ -244,6 +302,19 @@
                         delete clean.ticket;
                         delete clean.randstr;
                         reqBody = JSON.stringify(clean);
+                        bodyModified = true;
+                    }
+                    // [DEBUG] 打印 body 中的所有字段名，检查是否有其他一次性凭据
+                    if (shouldDetail) {
+                        dbgLog(`#${attemptNum} 原始body字段: [${Object.keys(bodyObj).join(', ')}]`);
+                        // 检测可能的一次性凭据字段
+                        const suspiciousKeys = Object.keys(bodyObj).filter(k =>
+                            /token|sign|nonce|timestamp|time|stamp|csrf|_t|rand|seed|seq/.test(k.toLowerCase())
+                        );
+                        if (suspiciousKeys.length > 0) {
+                            dbgLog(`#${attemptNum} ⚠️ 疑似一次性字段: ${suspiciousKeys.join(', ')} 值: ${suspiciousKeys.map(k => truncate(String(bodyObj[k]), 40)).join(' | ')}`);
+                        }
+                        if (bodyModified) dbgLog(`#${attemptNum} 已清理 ticket/randstr`);
                     }
                 } catch {}
             }
@@ -254,16 +325,28 @@
                 try {
                     const bodyObj = _parse(reqBody || '{}');
                     reqBody = JSON.stringify({ ...bodyObj, ticket: cachedTicket.ticket, randstr: cachedTicket.randstr });
+                    if (shouldDetail) dbgLog(`#${attemptNum} 装入验证码ticket=${truncate(cachedTicket.ticket, 20)} 队列剩余:${captchaQueue.length}`);
                 } catch {}
+            } else if (shouldDetail) {
+                dbgLog(`#${attemptNum} 无可用验证码ticket (队列空:${captchaQueue.length})`);
             }
 
+            if (shouldDetail) {
+                dbgLog(`#${attemptNum} 发送请求 → ${truncate(url, 60)}`);
+                dbgLog(`#${attemptNum} 最终body: ${truncate(reqBody, 200)}`);
+            }
+
+            const reqStart = performance.now();
             const resp = await _fetch(url, { ...opts, body: reqBody, headers: randHeaders, credentials: 'include', priority: 'high', keepalive: true });
+            const reqMs = Math.round(performance.now() - reqStart);
 
             // HTTP 状态码检测
             if (resp.status === 401 || resp.status === 403) {
+                dbgLog(`#${attemptNum} ❌ HTTP ${resp.status} (${reqMs}ms) — 会话/鉴权问题`);
                 return { ok: false, reason: `HTTP ${resp.status} 会话过期`, attempt: attemptNum };
             }
             if (resp.status === 429) {
+                if (shouldDetail) dbgLog(`#${attemptNum} ⚠️ 429 限流 (${reqMs}ms)`);
                 return { ok: false, reason: '429 限流', attempt: attemptNum };
             }
 
@@ -271,25 +354,38 @@
             let data;
             try { data = _parse(text); } catch { data = null; }
 
+            // [DEBUG] 详细响应日志
+            if (shouldDetail) {
+                dbgLog(`#${attemptNum} ← HTTP ${resp.status} (${reqMs}ms) 响应: ${truncate(text, 300)}`);
+            }
+
             if (data && data.code === 200 && data.data && data.data.bizId) {
                 const bizId = data.data.bizId;
+                dbgLog(`#${attemptNum} 🎯 拿到bizId=${bizId}! 即将check校验...`);
 
                 // check 校验（异步，不阻塞其他并发请求）
                 try {
                     const checkUrl = `${location.origin}${CFG.CHECK}?bizId=${encodeURIComponent(bizId)}`;
+                    const checkStart = performance.now();
                     const checkResp = await _fetch(checkUrl, { credentials: 'include' });
                     const checkText = await checkResp.text();
+                    const checkMs = Math.round(performance.now() - checkStart);
                     let checkData;
                     try { checkData = _parse(checkText); } catch { checkData = null; }
 
+                    dbgLog(`#${attemptNum} check响应 (${checkMs}ms): ${truncate(checkText, 200)}`);
+
                     if (checkData && checkData.data === 'EXPIRE') {
+                        dbgLog(`#${attemptNum} ❌ bizId=${bizId} 已EXPIRE! (preview→check间隔${checkMs}ms)`);
                         return { ok: false, reason: 'EXPIRE', attempt: attemptNum };
                     }
 
                     // 通过!
+                    dbgLog(`#${attemptNum} ✅ check通过! bizId=${bizId}`);
                     return { ok: true, text, data, bizId, status: resp.status, attempt: attemptNum };
                 } catch (e) {
                     // check 失败不丢弃 bizId，直接返回成功（让后续流程处理）
+                    dbgLog(`#${attemptNum} ⚠️ check请求异常: ${e.message}, 仍视为成功 bizId=${bizId}`);
                     return { ok: true, text, data, bizId, status: resp.status, attempt: attemptNum };
                 }
             }
@@ -297,6 +393,7 @@
             // 需要验证码 → 触发验证码流程
             const msg = (data && data.msg) || '';
             if (data && (msg.includes('验证') || msg.includes('安全') || msg.includes('captcha') || msg.includes('ticket'))) {
+                if (shouldDetail) dbgLog(`#${attemptNum} 服务端要求验证码: code=${data?.code} msg=${truncate(msg, 80)}`);
                 return { ok: false, reason: '需要验证码', needCaptcha: true, attempt: attemptNum };
             }
 
@@ -304,9 +401,23 @@
                 : data.code === 555 ? '系统繁忙'
                 : (data.data && data.data.bizId === null) ? '售罄'
                 : `code=${data.code}`;
+
+            // [DEBUG] 对每种失败原因详细记录
+            if (shouldDetail) {
+                if (reason === '售罄') {
+                    dbgLog(`#${attemptNum} 售罄 (data.bizId=${data.data?.bizId} data=${truncate(JSON.stringify(data.data || {}), 150)})`);
+                } else if (reason === '系统繁忙') {
+                    dbgLog(`#${attemptNum} 555 系统繁忙 msg=${truncate(msg, 100)}`);
+                } else if (reason === '非JSON') {
+                    dbgLog(`#${attemptNum} 非JSON响应 HTTP=${resp.status} body=${truncate(text, 150)}`);
+                } else {
+                    dbgLog(`#${attemptNum} 失败 reason=${reason} code=${data?.code} msg=${truncate(msg, 100)} data=${truncate(JSON.stringify(data?.data || {}), 150)}`);
+                }
+            }
             return { ok: false, reason, attempt: attemptNum };
         } catch (e) {
             if (e.name === 'AbortError') return { ok: false, reason: '已取消', attempt: attemptNum };
+            if (shouldDetail) dbgLog(`#${attemptNum} 💥 异常: ${e.name}: ${e.message}`);
             return { ok: false, reason: `网络: ${e.message}`, attempt: attemptNum };
         }
     }
@@ -452,6 +563,17 @@
                     // 日志
                     const sec = elapsedSec.toFixed(0);
                     log(`#${totalAttempt} ${reasons[0]} 并发:${adaptiveConcurrency} 在飞:${inFlight} (${sec}s)`);
+                    // [DEBUG] 失败原因统计
+                    if (DEBUG) {
+                        const counts = {};
+                        reasons.forEach(r => { counts[r] = (counts[r] || 0) + 1; });
+                        const summary = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(', ');
+                        dbgLog(`#${totalAttempt} 批次统计(20个): ${summary}`);
+                    }
+                    // 更新顶部横幅（显示最新失败原因）
+                    const topReasons = [...new Set(reasons.slice(0, 5))].join(', ');
+                    updateTopBar({ text: `⚡ 抢购中 | #${totalAttempt} | ${topReasons} | 在飞:${inFlight} | ${sec}s`, bg: '#e17055' });
+                    updateTitle('retrying', `#${totalAttempt} ${sec}s`);
                 }
             }
 
@@ -503,6 +625,24 @@
             };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
+
+            // [DEBUG] 详细记录捕获的请求
+            dbgLog('━━━ Fetch拦截: 捕获preview请求 ━━━');
+            dbgLog(`URL: ${url}`);
+            dbgLog(`Method: ${captured.method}`);
+            dbgLog(`Body: ${truncate(captured.body, 300)}`);
+            const headerKeys = Object.keys(captured.headers);
+            dbgLog(`Headers(${headerKeys.length}): [${headerKeys.join(', ')}]`);
+            // 检查 body 中的关键字段
+            if (captured.body && typeof captured.body === 'string') {
+                try {
+                    const bodyObj = _parse(captured.body);
+                    dbgLog(`Body字段: [${Object.keys(bodyObj).join(', ')}]`);
+                    Object.entries(bodyObj).forEach(([k, v]) => {
+                        dbgLog(`  .${k} = ${truncate(String(v), 60)}`);
+                    });
+                } catch {}
+            }
 
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
@@ -594,6 +734,18 @@
             const captured = { url, method: this._m, body, headers: this._h || {} };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
+
+            // [DEBUG] XHR 捕获日志
+            dbgLog('━━━ XHR拦截: 捕获preview请求 ━━━');
+            dbgLog(`URL: ${url}  Method: ${this._m}`);
+            dbgLog(`Body: ${truncate(body, 300)}`);
+            dbgLog(`Headers: [${Object.keys(this._h || {}).join(', ')}]`);
+            if (body && typeof body === 'string') {
+                try {
+                    const bodyObj = _parse(body);
+                    dbgLog(`Body字段: [${Object.keys(bodyObj).join(', ')}]`);
+                } catch {}
+            }
 
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
@@ -809,6 +961,19 @@
         }
         setState({ proactive: true });
         log(`极速抢购启动! 前${CFG.turboSec}秒${CFG.turboConcurrency}路并发, 之后${CFG.concurrency}路`);
+        // [DEBUG] 记录重试使用的参数
+        dbgLog(`重试参数 url=${truncate(url, 80)} method=${method}`);
+        dbgLog(`重试body: ${truncate(body, 300)}`);
+        dbgLog(`重试headers: [${Object.keys(headers).join(', ')}]`);
+        if (body && typeof body === 'string') {
+            try {
+                const bodyObj = _parse(body);
+                dbgLog(`重试body字段: [${Object.keys(bodyObj).join(', ')}]`);
+                Object.entries(bodyObj).forEach(([k, v]) => {
+                    dbgLog(`  .${k} = ${truncate(String(v), 60)}`);
+                });
+            } catch {}
+        }
 
         const { url, method, body, headers } = state.captured;
         const result = await retry(url, { method, body, headers });
@@ -1104,6 +1269,70 @@
     }
 
     // ═══════════════════════════════════════════
+    //  页面顶部状态横幅 + 声音 + 标题栏
+    // ═══════════════════════════════════════════
+    let _topBar = null;
+    const _origTitle = document.title || '智谱GLM';
+
+    /** 播放提示音 (Web Audio API，无需外部文件) */
+    function playBeep(freq = 880, duration = 200, vol = 0.3) {
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            gain.gain.value = vol;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration / 1000);
+            osc.stop(ctx.currentTime + duration / 1000);
+        } catch {}
+    }
+
+    function playSound(type) {
+        if (type === 'start') {
+            // 两声短促的升调
+            playBeep(660, 100, 0.25);
+            setTimeout(() => playBeep(880, 100, 0.25), 120);
+        } else if (type === 'success') {
+            // 三声升调和弦
+            playBeep(523, 150, 0.35);
+            setTimeout(() => playBeep(659, 150, 0.35), 160);
+            setTimeout(() => playBeep(784, 300, 0.4), 320);
+        } else if (type === 'fail') {
+            // 低沉下降
+            playBeep(440, 200, 0.3);
+            setTimeout(() => playBeep(330, 300, 0.3), 200);
+        }
+    }
+
+    /** 创建/更新页面顶部状态横幅 */
+    function updateTopBar(info) {
+        if (!_topBar) {
+            _topBar = document.createElement('div');
+            _topBar.id = 'glm-rush-topbar';
+            _topBar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999998;padding:8px 16px;text-align:center;font:bold 14px Consolas,monospace;color:#fff;transition:all .3s;pointer-events:none;';
+            document.body.appendChild(_topBar);
+        }
+        _topBar.style.background = info.bg || '#2d3436';
+        _topBar.textContent = info.text || '';
+        _topBar.style.display = info.text ? 'block' : 'none';
+    }
+
+    /** 更新浏览器标签标题 */
+    function updateTitle(status, extra) {
+        const prefix = {
+            idle: '',
+            retrying: '🔄 抢购中 | ',
+            success: '✅ 已抢到! | ',
+            failed: '❌ 失败 | ',
+        };
+        document.title = (prefix[status] || '') + (extra ? extra + ' | ' : '') + _origTitle;
+    }
+
+    // ═══════════════════════════════════════════
     //  浮动面板 (Shadow DOM)
     // ═══════════════════════════════════════════
     function createPanel() {
@@ -1123,10 +1352,10 @@
 .bd{padding:12px 14px 14px}
 .st{padding:8px;border-radius:8px;text-align:center;font-weight:700;margin-bottom:10px;transition:background .3s}
 .st-idle{background:#2d3436}
-.st-retrying{background:#e17055;animation:pulse 1s infinite}
-.st-success{background:#00b894}
+.st-retrying{background:#e17055;animation:pulse .8s infinite;font-size:14px;padding:10px}
+.st-success{background:#00b894;font-size:14px;padding:10px}
 .st-failed{background:#d63031}
-@keyframes pulse{50%{opacity:.7}}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 8px rgba(225,112,85,.6)}50%{opacity:.7;box-shadow:0 0 20px rgba(225,112,85,.9)}}
 .cap{font-size:11px;padding:5px 8px;background:#2d3436;border-radius:6px;margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .row{display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;flex-wrap:wrap}
 .row input[type=number],.row input[type=time]{width:60px;padding:4px 6px;border:1px solid #444;border-radius:4px;background:#2d3436;color:#fff;text-align:center;font-size:12px}
@@ -1148,7 +1377,7 @@
 .keys{font-size:10px;color:#636e72;text-align:center;margin-top:6px}
 </style>
 <div class="panel">
-  <div class="hd" id="drag"><b>GLM v4.10</b><button class="mn" id="min">-</button></div>
+  <div class="hd" id="drag"><b>GLM v4.12-DBG</b><button class="mn" id="min">-</button></div>
   <div class="bd" id="bd">
     <div class="st st-idle" id="st">等待中</div>
     <div class="cap" id="cap">${state.captured ? '已恢复上次捕获的请求' : '请先点一次购买按钮'}</div>
@@ -1173,7 +1402,7 @@
       <button class="b-heat" id="b-heat">预热</button>
     </div>
     <div class="logs" id="logs"></div>
-    <div class="keys">Alt+S 抢购 | Alt+X 停止 | Alt+H 隐藏</div>
+    <div class="keys">Alt+S 抢购 | Alt+X 停止 | Alt+H 隐藏 | Alt+D 导出调试日志</div>
   </div>
 </div>`;
 
@@ -1209,7 +1438,7 @@
         // 闭包引用供 refreshUI 使用
         _shadowRef = shadow;
 
-        log('v4.10 已加载 (AbortController+多次时间同步+多标签页协同+keepalive)');
+        log('v4.12-DBG 已加载 (调试模式 ON, 详情看F12控制台)');
         if (state.captured) log('已恢复上次捕获的请求参数, 可直接设定时间');
         setupDialogWatcher();
 
@@ -1251,6 +1480,13 @@
                     : `失败 (${state.count}次)`;
             }
 
+            // 更新顶部横幅和标题（抢购中时实时更新）
+            if (state.status === 'retrying') {
+                const sec = state.stats.startTime ? ((performance.now() - state.stats.startTime) / 1000).toFixed(0) : '0';
+                updateTopBar({ text: `⚡ 抢购进行中 | 已发 ${state.count} 次请求 | ${sec}s`, bg: '#e17055' });
+                updateTitle('retrying', `${state.count}次 ${sec}s`);
+            }
+
             const capEl = $('cap');
             if (capEl) {
                 capEl.textContent = state.captured
@@ -1282,6 +1518,12 @@
         el.appendChild(div);
         while (el.children.length > CFG.logMax) el.removeChild(el.firstChild);
         el.scrollTop = el.scrollHeight;
+
+        // 抢购成功时日志区域闪绿
+        if (entry.msg.includes('成功') || entry.msg.includes('bizId=')) {
+            el.style.outline = '2px solid #00b894';
+            setTimeout(() => { el.style.outline = ''; }, 2000);
+        }
     }
 
     // ═══════════════════════════════════════════
@@ -1297,7 +1539,7 @@
     // ═══════════════════════════════════════════
     //  启动
     // ═══════════════════════════════════════════
-    console.log('[GLM] v4.10 已注入');
+    console.log('[GLM] v4.12-debug 已注入 (DEBUG=ON)');
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', createPanel);
     } else {
